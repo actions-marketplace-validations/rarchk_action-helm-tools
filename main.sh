@@ -10,14 +10,87 @@ SCRIPT_DIR=$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}" || realpath "${BASH_S
 export SCRIPT_DIR
 source "$SCRIPT_DIR/common.sh"
 
+install_ark
 install_helm
 install_artifactory_plugin
 install_cmpush_plugin
-get_chart_version
-
+#get_chart_version
 case "${ACTION}" in
+    "lint")
+        print_title "Helm dependency build"
+        dependency_repo_add
+        safe_exec helm dependency build "${CHART_DIR}"
+
+        print_title "Helm Linting"
+        if [[ -f "${CHART_DIR}/linter_values.yaml" ]]; then
+            # allow for the same yaml layout that is used by gruntwork-io/pre-commit helmlint.sh
+            helm lint -f "${CHART_DIR}/values.yaml" -f "${CHART_DIR}/linter_values.yaml" "${CHART_DIR}"
+        else
+            helm lint "${CHART_DIR}"
+        fi
+        ;;
+    "audit")
+        install_polaris
+        print_title "Helm dependency build"
+        dependency_repo_add
+        helm dependency build "${CHART_DIR}"
+
+        print_title "Helm audit"
+        #polaris audit --helm-chart  "${CHART_DIR}" --helm-values "${CHART_DIR}/values.yaml" --format=pretty --quiet
+        #helm template ${CHART_DIR} -f ${CHART_DIR}/values.yaml  | kube-score score --color never -
+        send_github_comments "Computed Audit for ${CHART_DIR}" "bash" "$(helm template ${CHART_DIR} -f ${CHART_DIR}/values.yaml  | kube-score score --color never -)"
+
+        ;;
+    "diff")
+        print_title "Computing Helm diff"
+
+        # Setup repo
+        safe_exec helm repo add upstream-helm-repo "${ARTIFACTORY_URL}" --username "${ARTIFACTORY_USERNAME}" --password "${ARTIFACTORY_PASSWORD}"
+        safe_exec helm repo update upstream-helm-repo
+
+        # Fetch from chart
+        if [[ -z "${FROM_CHART}" ]]; then
+            touch /tmp/upstream_values.yaml
+            printf "\x1B[31m FROM_CHART: Will create empty template\n"
+        else
+            helm fetch "upstream-helm-repo/${CHART_NAME}" --version "${FROM_CHART}" --debug
+            if [[ -z "${OPTIONAL_VALUES}" ]]; then
+                helm template "${CHART_NAME}-${FROM_CHART}.tgz" -f "${CHART_DIR}/values.yaml" > /tmp/upstream_values.yaml
+            else
+                helm template "${CHART_NAME}-${FROM_CHART}.tgz" -f "${CHART_DIR}/values.yaml" --set "${OPTIONAL_VALUES}" > /tmp/upstream_values.yaml
+            fi
+        fi
+
+        ## Fecth To chart
+        if [[ -z "${TO_CHART}" ]]; then
+            if [[ -f "${CHART_DIR}/Chart.yaml" ]]; then
+                print_title "Helm dependency build"
+                dependency_repo_add
+                helm dependency build "${CHART_DIR}"
+                if [[ -z "${OPTIONAL_VALUES}" ]]; then
+                    helm template "${CHART_DIR}" -f "${CHART_DIR}/values.yaml"  > /tmp/current_values.yaml
+                else
+                    helm template "${CHART_DIR}" -f "${CHART_DIR}/values.yaml" --set "${OPTIONAL_VALUES}" > /tmp/current_values.yaml
+                fi
+            else
+                touch /tmp/current_values.yaml
+                printf "\x1B[31m FROM_CHART: Will create empty template\n"
+            fi
+        else
+            helm fetch "upstream-helm-repo/${CHART_NAME}" --version "${TO_CHART}" --debug
+            if [[ -z "${OPTIONAL_VALUES}" ]]; then
+                helm template "${CHART_NAME}-${TO_CHART}.tgz" -f "${CHART_DIR}/values.yaml" > /tmp/current_values.yaml
+            else
+                helm template "${CHART_NAME}-${TO_CHART}.tgz" -f "${CHART_DIR}/values.yaml" --set "${OPTIONAL_VALUES}" > /tmp/current_values.yaml
+            fi
+        fi
+        # Compute diff between two releases
+        send_github_comments "Computed Helm Diff for ${CHART_NAME}" "diff" "$(git diff --no-index  /tmp/upstream_values.yaml /tmp/current_values.yaml)"
+
+        ;;
     "package")
         print_title "Helm dependency build"
+        dependency_repo_add
         helm dependency build "${CHART_DIR}"
 
         print_title "Linting"
@@ -29,7 +102,7 @@ case "${ACTION}" in
         fi
 
         print_title "Helm package"
-        helm package "${CHART_DIR}" --version v"${CHART_VERSION}" --app-version "${CHART_VERSION}" --destination "${RUNNER_WORKSPACE}"
+        helm package "${CHART_DIR}" --version "${CHART_VERSION}" --app-version "${CHART_VERSION}" --destination "${RUNNER_WORKSPACE}"
         ;;
     "publish-artifactory")
         print_title "Push chart to artifactory"
@@ -37,8 +110,8 @@ case "${ACTION}" in
         ;;
     "publish-chartmuseum")
         print_title "Push chart to chartmuseum"
-        helm repo add amagi-charts "${ARTIFACTORY_URL}" --username "${ARTIFACTORY_USERNAME}" --password "${ARTIFACTORY_PASSWORD}"  
-        helm cm-push "${CHART_DIR}" amagi-charts || true 
+        helm repo add upstream-helm-repo "${ARTIFACTORY_URL}" --username "${ARTIFACTORY_USERNAME}" --password "${ARTIFACTORY_PASSWORD}"
+        helm cm-push "${CHART_DIR}" upstream-helm-repo || true
         ;;
     "publish-gar")
         print_title "Push chart on OCI registry"
@@ -101,3 +174,4 @@ case "${ACTION}" in
 esac
 
 remove_helm
+remove_ark

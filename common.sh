@@ -1,12 +1,16 @@
 #!/bin/bash -l
 set -eo pipefail
 
-export HELM_VERSION=${HELM_VERSION:="3.5.1"}
-export KUBECTL_VERSION=${KUBECTL_VERSION:="1.21.0"}
+export HELM_VERSION=${HELM_VERSION:="v3.13.3"}
+export KUBECTL_VERSION=${KUBECTL_VERSION:="v1.28.0"}
 export HELM_ARTIFACTORY_PLUGIN_VERSION=${HELM_ARTIFACTORY_PLUGIN_VERSION:="v1.0.2"}
 export HELM_CHARTMUSEUM_PLUGIN_VERSION=${HELM_CHARTMUSEUM_PLUGIN_VERSION:="0.10.3"}
 export CHART_VERSION=${CHART_VERSION:=""}
 export CHART_APP_VERSION=${CHART_APP_VERSION:=""}
+export DYFF_VERSION=${DYFF_VERSION:="1.6.0"}
+export YQ_VERSION=${YQ_VERSION:="v4.40.5"}
+export POLARIS_VERSION=${POLARIS_VERSION:="8.5.3"}
+export KUBE_SCORE_VERSION=${KUBE_SCORE_VERSION:="1.17.0"}
 
 export GCLOUD_PROJECT_CHECK=${GCLOUD_PROJECT_CHECK:="true"}
 
@@ -27,6 +31,10 @@ function helm_show(){
     [[ -n "$value" ]] && echo "$value" || echo "UNSET"
 }
 
+dependency_repo_add(){
+pip3 install pyyaml --user
+python3 -c "import yaml;import os;f=open('$CHART_DIR/Chart.yaml','r');  p=yaml.safe_load(f.read());print('\n'.join('helm repo add ' + 'repo' + str(idx) + ' ' + i['repository'] for idx, i in enumerate(p['dependencies']))) if 'dependencies' in p else print('echo Exception!'); f.close()" | xargs -I{} sh -c "{}" || true
+}
 get_chart_version(){
     if [ -n "$CHART_VERSION" ]; then
         echo "CHART_VERSION variable is already set (value: $CHART_VERSION), will override Chart.yaml"
@@ -48,10 +56,9 @@ get_chart_version(){
 }
 
 get_helm() {
-    print_title "Get helm:${HELM_VERSION}"
-    curl -L "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" | tar xvz
-    chmod +x linux-amd64/helm
-    sudo mv linux-amd64/helm /usr/local/bin/helm
+    print_title "Installing helm:${HELM_VERSION}"
+    ark get helm --version "${HELM_VERSION}" --quiet
+    helm version --short -c
 }
 
 install_helm() {
@@ -81,7 +88,7 @@ install_cmpush_plugin(){
 remove_helm(){
     helm plugin uninstall push-artifactory
     helm plugin uninstall cm-push
-    sudo rm -rf /usr/local/bin/helm
+    # sudo rm -rf /usr/local/bin/helm
 }
 
 function version {
@@ -94,4 +101,79 @@ check_helm_version_gte_3_8(){
         echo "Required helm version a least 3.8.0 currently running '${current_helm_version}'."
         exit 1
     fi
+}
+
+install_polaris() {
+    if ! command -v polaris; then
+        print_title "Installing polaris:${POLARIS_VERSION}"
+        ark get polaris  --version "${POLARIS_VERSION}" --quiet
+    fi
+    polaris version
+    if ! command -v kube-score; then
+        print_title "Installing kube-score:${POLARIS_VERSION}"
+        curl -L "https://github.com/zegl/kube-score/releases/download/v${KUBE_SCORE_VERSION}/kube-score_${KUBE_SCORE_VERSION}_linux_amd64.tar.gz" | tar xvz
+        chmod +x kube-score
+        sudo mv kube-score /usr/local/bin/kube-score
+    fi
+    kube-score version
+}
+
+install_yq() {
+    if ! command -v yq; then
+        print_title "Installing yq:${YQ_VERSION}"
+        ark get yq  --version "${YQ_VERSION}" --quiet
+    fi
+    yq --version
+}
+
+install_ark() {
+    if ! command -v ark; then
+        echo "ark is missing"
+        curl -sLS https://get.arkade.dev | sudo sh
+    fi 
+    export PATH=$PATH:$HOME/.arkade/bin/
+}
+
+remove_ark() {
+    rm -f $HOME/.arkade/bin/*
+}
+
+safe_exec(){
+    start=$(date +%s)
+    $@
+    end=$(date +%s)
+    echo "Elapsed time for executing $@: $(($end-$start)) seconds"
+}
+
+send_github_comments() {
+    if [[ -z "${2}" ]]; then
+        printf "No highlighting format passed"
+        exit 0
+    fi
+    if [[ -z "${3}" ]]; then
+        printf "No data passed. Skipping posting comments"
+        exit 0
+    fi
+    COMMENT="### $1 Output
+<details>
+<summary>Check out here</summary>
+
+#### $1
+
+\`\`\`$2
+
+$3
+
+\`\`\`
+
+</details>"
+
+        PAYLOAD=$(echo '{}' | jq --arg body "$COMMENT" '.body = $body')
+        COMMENTS_URL=$(cat "$GITHUB_EVENT_PATH" | jq -r .pull_request.comments_url)
+        echo "Commenting on PR $COMMENTS_URL"
+        curl --silent -X POST \
+          --header 'content-type: application/json' \
+          --header  "Authorization: token $GITHUB_TOKEN" \
+          --data "$PAYLOAD" "$COMMENTS_URL" > /dev/null
+        exit 0 
 }
